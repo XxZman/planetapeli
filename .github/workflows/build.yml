@@ -1,0 +1,61 @@
+name: Build and Release APK
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from pubspec.yaml
+        id: version
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | sed 's/version:[[:space:]]*//' | sed 's/+.*//' | tr -d ' \r\n')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Versión detectada: $VERSION"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.3'
+          channel: 'stable'
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Create GitHub Release and upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: PlanetaPeli v${{ steps.version.outputs.version }}
+          body: |
+            ## PlanetaPeli v${{ steps.version.outputs.version }}
+            Descarga el APK y ábrelo en tu Android para instalar.
+          files: build/app/outputs/flutter-apk/app-release.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notificar al backend la nueva versión
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          APK_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/app-release.apk"
+          echo "Notificando backend: versión ${VERSION}, URL: ${APK_URL}"
+          curl -f -s -X PUT "${{ secrets.BACKEND_URL }}/api/admin/version" \
+            -H "Content-Type: application/json" \
+            -H "x-admin-token: ${{ secrets.BACKEND_VERSION_TOKEN }}" \
+            -d "{\"version\": \"${VERSION}\", \"url\": \"${APK_URL}\"}" \
+            || echo "Advertencia: no se pudo notificar al backend (continúa de todas formas)"
