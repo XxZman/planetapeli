@@ -2,7 +2,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import 'package:better_player/better_player.dart';
+import 'package:video_player/video_player.dart';
+import 'package:chewie/chewie.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:screen_brightness/screen_brightness.dart';
 import '../models/movie.dart';
@@ -40,7 +41,8 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> {
-  BetterPlayerController? _betterCtrl;
+  VideoPlayerController? _videoCtrl;
+  ChewieController? _chewieCtrl;
   WebViewController? _webCtrl;
 
   List<VideoServer> _servers = [];
@@ -73,10 +75,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
   // Toast
   OverlayEntry? _toastEntry;
 
+  // Progress save throttle
+  int _lastSavedSec = -1;
+
   @override
   void initState() {
     super.initState();
-    // Do NOT force landscape — respect user's current orientation
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersive);
     _servers = widget.movie.servidores;
     if (_servers.isNotEmpty) _loadServer(_servers.first);
@@ -94,8 +98,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void dispose() {
     _hideTimer?.cancel();
     _indicatorHideTimer?.cancel();
-    _betterCtrl?.removeEventsListener(_onPlayerEvent);
-    _betterCtrl?.dispose();
+    _videoCtrl?.removeListener(_onVideoListener);
+    _chewieCtrl?.dispose();
+    _videoCtrl?.dispose();
     _toastEntry?.remove();
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
@@ -146,11 +151,14 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Future<void> _loadServer(VideoServer server) async {
     final isFirstLoad = _currentServer == null;
 
-    // Clean up old controller BEFORE setState to avoid rendering disposed ctrl
-    _betterCtrl?.removeEventsListener(_onPlayerEvent);
-    _betterCtrl?.dispose();
-    _betterCtrl = null;
+    // Clean up old controllers BEFORE setState
+    _videoCtrl?.removeListener(_onVideoListener);
+    _chewieCtrl?.dispose();
+    _videoCtrl?.dispose();
+    _chewieCtrl = null;
+    _videoCtrl = null;
     _webCtrl = null;
+    _lastSavedSec = -1;
 
     setState(() {
       _loading = true;
@@ -163,7 +171,9 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
     if (!isFirstLoad) {
       _showToast(
-        server.nombre.isNotEmpty ? server.nombre : '${server.idioma} · ${server.calidad}',
+        server.nombre.isNotEmpty
+            ? server.nombre
+            : '${server.idioma} · ${server.calidad}',
       );
     }
 
@@ -195,61 +205,64 @@ class _PlayerScreenState extends State<PlayerScreen> {
       setState(() {});
     } else {
       try {
-        final url = server.url;
-        final isHls = url.toLowerCase().split('?').first.endsWith('.m3u8');
-        final savedPos = context.read<HistoryProvider>().getPosition(widget.movie.id);
+        final savedPos =
+            context.read<HistoryProvider>().getPosition(widget.movie.id);
 
-        final dataSource = BetterPlayerDataSource(
-          BetterPlayerDataSourceType.network,
-          url,
-          headers: server.headers.isNotEmpty ? server.headers : null,
-          videoFormat: isHls
-              ? BetterPlayerVideoFormat.hls
-              : BetterPlayerVideoFormat.other,
+        final videoCtrl = VideoPlayerController.networkUrl(
+          Uri.parse(server.url),
+          httpHeaders: server.headers.isNotEmpty ? server.headers : {},
+        );
+        await videoCtrl.initialize();
+
+        if (!mounted) {
+          videoCtrl.dispose();
+          return;
+        }
+
+        if (savedPos != null && savedPos > Duration.zero) {
+          await videoCtrl.seekTo(savedPos);
+        }
+
+        final chewieCtrl = ChewieController(
+          videoPlayerController: videoCtrl,
+          autoPlay: true,
+          showControls: false,
+          aspectRatio: 16 / 9,
+          allowFullScreen: false,
+          allowMuting: false,
+          looping: false,
         );
 
-        _betterCtrl = BetterPlayerController(
-          BetterPlayerConfiguration(
-            autoPlay: true,
-            aspectRatio: 16 / 9,
-            fit: BoxFit.contain,
-            startAt: savedPos,
-            looping: false,
-            fullScreenByDefault: false,
-            allowedScreenSleep: false,
-            // Use custom theme so we render our own controls on top
-            controlsConfiguration: BetterPlayerControlsConfiguration(
-              playerTheme: BetterPlayerTheme.custom,
-              customControlsBuilder: (ctrl, onVisibilityChanged) =>
-                  const SizedBox.shrink(),
-              showControlsOnInitialize: false,
-            ),
-          ),
-          betterPlayerDataSource: dataSource,
-        );
-
-        _betterCtrl!.addEventsListener(_onPlayerEvent);
+        videoCtrl.addListener(_onVideoListener);
         _volumeValue = 1.0;
-        setState(() => _loading = false);
-      } catch (e) {
+
         setState(() {
+          _videoCtrl = videoCtrl;
+          _chewieCtrl = chewieCtrl;
           _loading = false;
-          _error = 'Error al cargar:\n$e';
         });
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _loading = false;
+            _error = 'Error al cargar:\n$e';
+          });
+        }
       }
     }
   }
 
-  void _onPlayerEvent(BetterPlayerEvent event) {
-    if (!mounted) return;
-    if (event.betterPlayerEventType == BetterPlayerEventType.progress) {
-      final pos = _betterCtrl?.videoPlayerController?.value.position;
-      if (pos != null && pos.inSeconds % 10 == 0 && pos.inSeconds > 0) {
-        context.read<HistoryProvider>().addOrUpdate(widget.movie, pos);
-      }
+  void _onVideoListener() {
+    if (!mounted || _videoCtrl == null) return;
+    final value = _videoCtrl!.value;
+    if (value.hasError) {
+      if (_error == null) setState(() => _error = 'Error al reproducir el video');
+      return;
     }
-    if (event.betterPlayerEventType == BetterPlayerEventType.exception) {
-      setState(() => _error = 'Error al reproducir el video');
+    final sec = value.position.inSeconds;
+    if (sec > 0 && sec % 10 == 0 && sec != _lastSavedSec) {
+      _lastSavedSec = sec;
+      context.read<HistoryProvider>().addOrUpdate(widget.movie, value.position);
     }
   }
 
@@ -297,7 +310,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
   void _handleVolumeDrag(DragUpdateDetails details) {
     final delta = -details.delta.dy / MediaQuery.of(context).size.height * 2;
     _volumeValue = (_volumeValue + delta).clamp(0.0, 1.0);
-    _betterCtrl?.videoPlayerController?.setVolume(_volumeValue);
+    _videoCtrl?.setVolume(_volumeValue);
     _indicatorHideTimer?.cancel();
     setState(() => _showVolumeIndicator = true);
     _indicatorHideTimer = Timer(const Duration(seconds: 2), () {
@@ -333,7 +346,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
-    final showNativeControls = !_useWebView && _betterCtrl != null;
+    final showNativeControls =
+        !_useWebView && _videoCtrl != null && _chewieCtrl != null;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -386,7 +400,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
                           : const Offset(0, 0.04),
                       duration: const Duration(milliseconds: 300),
                       curve: Curves.easeOut,
-                      child: _CustomPlayerControls(controller: _betterCtrl!),
+                      child: _CustomPlayerControls(controller: _videoCtrl!),
                     ),
                   ),
                 ),
@@ -524,7 +538,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
                     Text(
                       '${server.nombre.isNotEmpty ? server.nombre : "Servidor"}'
                       ' · ${server.idioma} · ${server.calidad}',
-                      style: const TextStyle(color: Colors.white70, fontSize: 11),
+                      style:
+                          const TextStyle(color: Colors.white70, fontSize: 11),
                       overflow: TextOverflow.ellipsis,
                     ),
                 ],
@@ -613,8 +628,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
       return WebViewWidget(controller: _webCtrl!);
     }
 
-    if (_betterCtrl != null) {
-      return BetterPlayer(controller: _betterCtrl!);
+    if (_chewieCtrl != null) {
+      return Chewie(controller: _chewieCtrl!);
     }
 
     if (_servers.isEmpty) {
@@ -643,7 +658,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
 // ══════════════════════════════════════════════════════════════════════════════
 
 class _CustomPlayerControls extends StatefulWidget {
-  final BetterPlayerController controller;
+  final VideoPlayerController controller;
   const _CustomPlayerControls({required this.controller});
 
   @override
@@ -652,49 +667,19 @@ class _CustomPlayerControls extends StatefulWidget {
 
 class _CustomPlayerControlsState extends State<_CustomPlayerControls> {
   @override
-  void initState() {
-    super.initState();
-    widget.controller.addEventsListener(_onEvent);
-  }
-
-  @override
   void didUpdateWidget(_CustomPlayerControls oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.controller != widget.controller) {
-      try {
-        oldWidget.controller.removeEventsListener(_onEvent);
-      } catch (_) {}
-      widget.controller.addEventsListener(_onEvent);
-      setState(() {});
-    }
-  }
-
-  @override
-  void dispose() {
-    try {
-      widget.controller.removeEventsListener(_onEvent);
-    } catch (_) {}
-    super.dispose();
-  }
-
-  void _onEvent(BetterPlayerEvent event) {
-    if (mounted &&
-        event.betterPlayerEventType == BetterPlayerEventType.initialized) {
-      setState(() {});
-    }
+    if (oldWidget.controller != widget.controller) setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
-    final vpc = widget.controller.videoPlayerController;
-    if (vpc == null) return const SizedBox.shrink();
-
     return ValueListenableBuilder<VideoPlayerValue>(
-      valueListenable: vpc,
+      valueListenable: widget.controller,
       builder: (context, value, _) {
         final isPlaying = value.isPlaying;
         final position = value.position;
-        final duration = value.duration ?? Duration.zero;
+        final duration = value.duration;
         final buffered = value.buffered.isNotEmpty
             ? value.buffered.last.end
             : Duration.zero;
@@ -735,8 +720,8 @@ class _CustomPlayerControlsState extends State<_CustomPlayerControls> {
                     size: 34,
                     onTap: () {
                       final np = position - const Duration(seconds: 10);
-                      widget.controller.seekTo(
-                          np < Duration.zero ? Duration.zero : np);
+                      widget.controller
+                          .seekTo(np < Duration.zero ? Duration.zero : np);
                     },
                   ),
                   const SizedBox(width: 28),
@@ -759,8 +744,7 @@ class _CustomPlayerControlsState extends State<_CustomPlayerControls> {
                     size: 34,
                     onTap: () {
                       final np = position + const Duration(seconds: 10);
-                      widget.controller
-                          .seekTo(np > duration ? duration : np);
+                      widget.controller.seekTo(np > duration ? duration : np);
                     },
                   ),
                 ],
@@ -778,7 +762,7 @@ class _CustomPlayerControlsState extends State<_CustomPlayerControls> {
 // ══════════════════════════════════════════════════════════════════════════════
 
 class _ProgressBar extends StatefulWidget {
-  final BetterPlayerController controller;
+  final VideoPlayerController controller;
   final Duration position;
   final Duration duration;
   final Duration buffered;
@@ -821,8 +805,8 @@ class _ProgressBarState extends State<_ProgressBar> {
   }
 
   void _seekTo(double pct) {
-    widget.controller.seekTo(Duration(
-        milliseconds: (pct * widget.duration.inMilliseconds).round()));
+    widget.controller.seekTo(
+        Duration(milliseconds: (pct * widget.duration.inMilliseconds).round()));
   }
 
   @override
@@ -854,14 +838,12 @@ class _ProgressBarState extends State<_ProgressBar> {
               onHorizontalDragStart: (d) {
                 setState(() {
                   _isDragging = true;
-                  _dragValue =
-                      (d.localPosition.dx / w).clamp(0.0, 1.0);
+                  _dragValue = (d.localPosition.dx / w).clamp(0.0, 1.0);
                 });
               },
               onHorizontalDragUpdate: (d) {
                 setState(() {
-                  _dragValue =
-                      (d.localPosition.dx / w).clamp(0.0, 1.0);
+                  _dragValue = (d.localPosition.dx / w).clamp(0.0, 1.0);
                 });
               },
               onHorizontalDragEnd: (_) {
@@ -941,8 +923,7 @@ class _ProgressBarState extends State<_ProgressBar> {
                     // Time preview while dragging
                     if (_isDragging && _dragValue != null)
                       Positioned(
-                        left:
-                            (_dragValue! * w - 28).clamp(0.0, w - 58),
+                        left: (_dragValue! * w - 28).clamp(0.0, w - 58),
                         bottom: 22,
                         child: Container(
                           padding: const EdgeInsets.symmetric(
@@ -1153,8 +1134,7 @@ class _ToastWidgetState extends State<_ToastWidget>
     _anim = AnimationController(
         duration: const Duration(milliseconds: 300), vsync: this);
     _fade = CurvedAnimation(parent: _anim, curve: Curves.easeOut);
-    _slide = Tween<Offset>(
-            begin: const Offset(0, 0.3), end: Offset.zero)
+    _slide = Tween<Offset>(begin: const Offset(0, 0.3), end: Offset.zero)
         .animate(CurvedAnimation(parent: _anim, curve: Curves.easeOut));
     _anim.forward();
 
@@ -1201,8 +1181,7 @@ class _ToastWidgetState extends State<_ToastWidget>
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.dns_rounded,
-                      color: Colors.white, size: 15),
+                  const Icon(Icons.dns_rounded, color: Colors.white, size: 15),
                   const SizedBox(width: 8),
                   Text(
                     widget.message,
@@ -1288,9 +1267,9 @@ class _ServerPanel extends StatelessWidget {
             child: Row(
               children: [
                 ShaderMask(
-                  shaderCallback: (b) => const LinearGradient(
-                          colors: [_purple, _blue])
-                      .createShader(b),
+                  shaderCallback: (b) =>
+                      const LinearGradient(colors: [_purple, _blue])
+                          .createShader(b),
                   child: const Text(
                     'Servidores',
                     style: TextStyle(
@@ -1324,8 +1303,7 @@ class _ServerPanel extends StatelessWidget {
             child: filteredServers.isEmpty
                 ? const Center(
                     child: Text('Sin servidores',
-                        style:
-                            TextStyle(color: Colors.grey, fontSize: 12)))
+                        style: TextStyle(color: Colors.grey, fontSize: 12)))
                 : ListView.builder(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 12, vertical: 10),
@@ -1353,9 +1331,7 @@ class _ServerChip extends StatelessWidget {
   final bool isActive;
   final VoidCallback onTap;
   const _ServerChip(
-      {required this.server,
-      required this.isActive,
-      required this.onTap});
+      {required this.server, required this.isActive, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -1364,8 +1340,7 @@ class _ServerChip extends StatelessWidget {
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 200),
         margin: const EdgeInsets.only(right: 10, top: 2, bottom: 2),
-        padding:
-            const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
         decoration: BoxDecoration(
           gradient: isActive
               ? const LinearGradient(colors: [_purple, _blue])
@@ -1373,9 +1348,8 @@ class _ServerChip extends StatelessWidget {
           color: isActive ? null : const Color(0xFF111122),
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
-              color: isActive
-                  ? Colors.transparent
-                  : const Color(0xFF2a2a3e)),
+              color:
+                  isActive ? Colors.transparent : const Color(0xFF2a2a3e)),
           boxShadow: isActive
               ? [
                   BoxShadow(
@@ -1406,9 +1380,8 @@ class _ServerChip extends StatelessWidget {
                       : 'Servidor ${server.idioma}',
                   style: TextStyle(
                     color: isActive ? Colors.white : Colors.grey,
-                    fontWeight: isActive
-                        ? FontWeight.bold
-                        : FontWeight.normal,
+                    fontWeight:
+                        isActive ? FontWeight.bold : FontWeight.normal,
                     fontSize: 13,
                   ),
                 ),
@@ -1418,9 +1391,7 @@ class _ServerChip extends StatelessWidget {
             Text(
               '${server.idioma} · ${server.calidad}',
               style: TextStyle(
-                color: isActive
-                    ? Colors.white70
-                    : Colors.grey.shade700,
+                color: isActive ? Colors.white70 : Colors.grey.shade700,
                 fontSize: 11,
               ),
             ),
@@ -1436,9 +1407,7 @@ class _FilterDrop extends StatelessWidget {
   final List<String> items;
   final void Function(String) onChanged;
   const _FilterDrop(
-      {required this.value,
-      required this.items,
-      required this.onChanged});
+      {required this.value, required this.items, required this.onChanged});
 
   @override
   Widget build(BuildContext context) {
@@ -1453,9 +1422,8 @@ class _FilterDrop extends StatelessWidget {
       items: items
           .map((i) => DropdownMenuItem(
               value: i,
-              child: Text(i,
-                  style: const TextStyle(
-                      color: Colors.white, fontSize: 12))))
+              child:
+                  Text(i, style: const TextStyle(color: Colors.white, fontSize: 12))))
           .toList(),
       onChanged: (v) {
         if (v != null) onChanged(v);
