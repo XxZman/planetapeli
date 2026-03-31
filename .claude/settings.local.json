@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(TOKEN=\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY5YzQyNjVjNDg5MTEwMDU0NWVlYzJhNyIsImlhdCI6MTc3NDQ2MjU1NiwiZXhwIjoxNzc3MDU0NTU2fQ.9SJhvvgT_-h3PsbpDmsFh6-6mayIYZqiTDjUHohs-38\")",
+      "Bash(flutter pub:*)",
+      "Bash(flutter analyze:*)",
+      "Bash(flutter build:*)"
+    ]
+  }
+}
