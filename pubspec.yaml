@@ -15,7 +15,7 @@ dependencies:
   provider: ^6.1.2
   cached_network_image: ^3.4.1
   better_player: ^0.0.84
-  webview_flutter: ^4.13.0
+  webview_flutter: ^4.4.4
   screen_brightness: ^0.2.2+1
   url_launcher: ^6.3.0
 
